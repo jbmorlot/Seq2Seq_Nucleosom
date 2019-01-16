@@ -56,7 +56,7 @@ class Seq2Seq:
         self.encoder = EncoderRNN(input_size, self.hidden_size,n_layers=n_layers)
         self.decoder = AttnDecoderRNN(input_size,self.hidden_size, seq_len_DNA,output_size,
                                       dropout_p=dropout_p,n_layers=n_layers)
-        self.EH2DH = EncoderHidden2DecoderHidden(self.hidden_size,n_layers)
+        self.EH2DH = EncoderHidden2DecoderHidden(self.hidden_size)
 
         self.criterion = nn.MSELoss()
         # self.criterion = nn.L1Loss()
