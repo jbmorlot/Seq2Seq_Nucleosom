@@ -12,6 +12,7 @@ from torch.utils.data import Dataset,random_split,DataLoader
 
 import torchvision.utils as vutils
 import torchvision.transforms as transforms
+# import torch.multiprocessing as multiprocessing
 # import torchsample as ts
 
 from tensorboardX import SummaryWriter
@@ -20,187 +21,268 @@ from tensorboardX import SummaryWriter
 
 from tqdm import tqdm
 
-from model import Seq2Seq
+from model import *
 from loss import *
 from utils import *
 
 
-
-class Seq2Seq_model:
+class Seq2Seq:
     '''
         Seq2seq architecture with attention which aim to predict the nucleosom frequency
         from DNA sequence
+
+        inputs:
+             fasta_path: Path of the FASTA file
+             histone_path: Path of the histone frequency in BEDGRAPH format
+             input_size=5 : Input vocabulary size: 4 DNA nucletotides and 1 "out of range" value
+             output_size=1: size of the output: 1-d vector
+             Nepochs: Number of epochs
+             batch_size: batch size
+             seq_len_hist: Lenght of the predicted histone sequence
+             seq_len_DNA: Lenght of the DNA sequence used to predict 'seq_len_hist' histone frequency.
+                          The DNA sequence is centered around histones' sequence.
+             hidden_size: size of the RNN hidden vectors
+             dropout_p: Dropout of the attention over the  previous decoder output
+             n_layers: Number of layers per RNN
     '''
 
     def __init__(self,fasta_path,histone_path,
-                 output_size,Nepochs=10,
-                 seq_len=50000,
-                 batchsize=1,
+                 input_size,
+                 output_size,
+                 Nepochs=10,
+                 batch_size=1,
+                 seq_len_DNA=50000,
+                 seq_len_hist=5000,
                  hidden_size=128,
-                 input_dropout_p=0,
-                 n_layers=1,
-                 use_cuda=True):
+                 dropout_p=0,
+                 n_layers=1):
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.batch_size = batch_size
+
+        self.n_layers = n_layers
+
+        self.hidden_size = hidden_size
+        self.encoder = EncoderRNN(input_size, self.hidden_size,n_layers=n_layers)
+        self.decoder = AttnDecoderRNN(input_size,self.hidden_size, seq_len_DNA,output_size,
+                                      dropout_p=dropout_p,n_layers=n_layers)
+        self.EH2DH = EncoderHidden2DecoderHidden(self.hidden_size,n_layers)
+
+        self.criterion = nn.MSELoss()
+        # self.criterion = nn.L1Loss()
+
+        if self.device.type=='cuda':
+            self.encoder.cuda()
+            self.decoder.cuda()
+            self.EH2DH.cuda()
+            self.criterion.cuda()
+
+        self.encoder_optimizer = optim.Adam(self.encoder.parameters(),lr=0.0001,betas=(0.9,0.999))
+        self.decoder_optimizer = optim.Adam(self.decoder.parameters(),lr=0.0001,betas=(0.9,0.999))
+        self.EH2DH_optimizer = optim.Adam(self.EH2DH.parameters(),lr=0.0001,betas=(0.9,0.999))
+
+        # self.encoder_optimizer = optim.SGD(self.encoder.parameters(), lr=0.01)
+        # self.decoder_optimizer = optim.SGD(self.decoder.parameters(), lr=0.01)
+        # self.EH2DH_optimizer = optim.SGD(self.EH2DH.parameters(), lr=0.01)
 
 
-        self.use_cuda = use_cuda
 
-        self.batchsize = batchsize
+        self.seq_len_DNA = seq_len_DNA
+        self.seq_len_hist = seq_len_hist
 
-        self.Seq2Seq = Seq2Seq(output_size, hidden_size,
-                              input_dropout_p=input_dropout_p,
-                              n_layers=n_layers)
-        if use_cuda:
-            self.Seq2Seq.cuda()
-
-
-
-        # self.loss = Perplexity()
-        self.loss = nn.CosineSimilarity()
-        if use_cuda:
-            self.loss.cuda()
-
-        self.optim = optim.Adam(self.Seq2Seq.parameters(),lr=0.0001,betas=(0.9,0.999))
-
-        self.seq_len = seq_len
-
-        train_dataset,val_dataset = get_dataset(histone_path,fasta_path,self.seq_len)
-
-        self.train_loader = DataLoader(train_dataset,
-                                        batch_size=self.batchsize,
-                                        shuffle=False,
-                                        num_workers=30,
-                                        pin_memory=True)
-
-        self.val_loader = DataLoader(val_dataset,
-                                        batch_size=self.batchsize,
-                                        shuffle=False,
-                                        num_workers=30,
-                                        pin_memory=True)
+        self.train_loader,self.val_loader = get_dataset(histone_path,
+                                                fasta_path,
+                                                self.seq_len_DNA,
+                                                self.seq_len_hist,
+                                                self.device,
+                                                self.batch_size)
 
         self.StartEpochs=0
         self.Nepochs = Nepochs
 
+        self.teacher_forcing_ratio=0.5
+
         self.train_len = len(self.train_loader)
         self.val_len = len(self.val_loader)
-
-        self.train_iter = int(np.ceil(self.train_len/self.batchsize))
-        self.val_iter = int(np.ceil(self.val_len/self.batchsize))
-
 
         self.loss_record = {key:[] for key in ['train','val']}
         self.writer = SummaryWriter('./logs/') #Writter for image saving
 
-    def fit(self):
+    def train(self):
+        '''
+            Train the model on training set
+        '''
 
         for self.epoch in tqdm(range(self.StartEpochs,self.Nepochs)):
 
-            #In training phase weight are optimized
-            self.Seq2Seq.train()
+            self.encoder.train()
+            self.decoder.train()
+            self.EH2DH.train()
             self.phase = 'train'
 
             self.clear_loss_records()
+            self.encoder_hidden = self.encoder.initHidden(self.device,self.batch_size)
+            self.decoder_hidden = self.decoder.initHidden(self.device,self.batch_size)
+            self.decoder_input = torch.zeros(self.batch_size,1,1,dtype=torch.float,device=self.device)
 
-            for self.counter,(self.X,self.Y) in enumerate(tqdm(self.train_loader,total=self.train_iter,desc='train')):
 
-                # self.X = torch.transpose(self.X,1,0)
-                # self.Y = torch.transpose(self.Y,1,0)
+            for self.counter,(self.input_tensor,self.target_tensor) in enumerate(tqdm(self.train_loader,total=self.train_len,desc='train')):
 
-                self.X = Variable(self.X,requires_grad=True)#.cuda()
-                self.Y = Variable(self.Y)#.cuda()
-
-                if self.use_cuda:
-                    self.X = self.X.long().cuda()
-                    self.Y = self.Y.cuda()
-
-                self.foreward()
+                self.forward()
                 self.backward()
-                self.record_loss()
-                self.tensorboard()
 
-    def foreward(self):
-        self.decoder_outputs, self.attention_list = self.Seq2Seq(self.X)
+            self.validate()
+            self.write2tensorboard()
+
+    def forward(self):
+        '''
+            Model forward pass: Encoder -> Decoder with attention
+        '''
+        #Gradient initialization
+        self.encoder_optimizer.zero_grad()
+        self.decoder_optimizer.zero_grad()
+        self.EH2DH_optimizer.zero_grad()
+
+        encoder_outputs = torch.zeros(self.batch_size,self.hidden_size*2,self.seq_len_DNA, dtype=torch.float, device=self.device)
+        self.decoder_outputs = torch.zeros_like(self.target_tensor, dtype=torch.float, device=self.device)
+
+        #Record attention
+        if self.phase=='pred':
+            decoder_attentions = torch.zeros(self.seq_len_hist, self.seq_len_DNA, dtype=torch.float, device=self.device)
+
+        # Encoder
+        for ei in range(self.seq_len_DNA):
+            encoder_output, self.encoder_hidden = self.encoder(self.input_tensor[:,:,ei], self.encoder_hidden)
+            encoder_outputs[:,:,ei] = encoder_output[0, 0]
+            if ei==self.seq_len_hist-1:
+                self.encoder_hidden_out = self.encoder_hidden.detach()
+
+        # Initialize decoder hidden using encoder hidden and decoder hidden at previous step
+        self.decoder_hidden = self.EH2DH(self.encoder_hidden,self.decoder_hidden)
+
+
+        # Teacher forcing: Use output given by the network at previous step or the ground truth value
+        use_teacher_forcing = True if torch.rand(1) < self.teacher_forcing_ratio else False
+
+        # Teacher forcing: Feed the target as the next input
+        if use_teacher_forcing and self.phase=='train':
+            for di in range(self.seq_len_hist):
+                decoder_output, self.decoder_hidden, decoder_attention = self.decoder(self.decoder_input,
+                                                                             self.decoder_hidden, encoder_outputs)
+                self.decoder_input = self.target_tensor[:,:,di].unsqueeze(2)  # Teacher forcing
+                self.decoder_outputs[:,0,di] = decoder_output.squeeze()
+
+
+        # Without teacher forcing: use its own predictions as the next input
+        else:
+            for di in range(self.seq_len_hist):
+                decoder_output, self.decoder_hidden, decoder_attention = self.decoder(
+                    self.decoder_input, self.decoder_hidden, encoder_outputs)
+
+                self.decoder_input = decoder_output.detach()  # detach from history as input for next step
+                self.decoder_outputs[:,0,di] = decoder_output.squeeze()
+
+        if self.phase=='train' or self.phase=='val':
+            self.loss = self.criterion(self.decoder_outputs.float(), self.target_tensor.float())
+            self.record_loss()
+
+        #Detach hidden states
+        self.decoder_hidden = self.decoder_hidden.detach()
+        self.encoder_hidden = self.encoder_hidden_out #Already detached
+
+
+        if self.phase=='pred':
+            decoder_attentions = torch.cat([decoder_attention.detach().data for decoder_attention in decoder_attentions],0)
+            return self.decoder_outputs.detach().data,decoder_attentions
+
+
 
     def backward(self):
-        self.compute_loss()
-        self.S2S_loss.backward()
-        self.optim.step()
-
-
-    def compute_loss(self):
-        self.S2S_loss = self.loss(self.decoder_outputs,self.Y)
+        '''
+            Model backward
+        '''
+        self.loss.backward()
+        self.decoder_optimizer.step()
+        self.EH2DH_optimizer.step()
+        self.encoder_optimizer.step()
 
 
     def record_loss(self):
-        self.loss_record[self.phase].append(var2numpy(self.S2S_loss.mean(),use_cuda=self.use_cuda))
+        self.loss_record[self.phase].append(trch2npy(self.loss.mean(),self.device))
 
     def clear_loss_records(self):
         for p in ['train','val']:
             self.loss_record[p] = []
 
     def validate(self):
+        '''
+            Compute loss score on validation set
+        '''
 
-        #In training phase weight are optimized
-        self.Seq2Seq.eval()
+        self.encoder.eval()
+        self.decoder.eval()
+        self.EH2DH.eval()
         self.phase = 'val'
-        for self.counter,(self.X,self.Y) in enumerate(tqdm(self.test_loader,total=self.val_iter,desc='validation')):
 
-            self.X = Variable(self.X,requires_grad=True)#.cuda()
-            self.Y = Variable(self.Y).long()#.cuda()
+        self.encoder_hidden = self.encoder.initHidden(self.device,self.batch_size)
+        self.decoder_hidden = self.decoder.initHidden(self.device,self.batch_size)
+        self.decoder_input = torch.zeros(self.batch_size,1,1,dtype=torch.float,device=self.device)
 
-            if self.use_cuda:
-                self.X = self.X.cuda()
-                self.Y = self.Y.cuda()
+
+        for self.counter,(self.input_tensor,self.target_tensor) in enumerate(tqdm(self.val_loader,total=self.val_len,desc='validation')):
 
             with torch.no_grad():
-                self.foreward()
-                self.compute_loss()
+                self.forward()
                 self.record_loss()
+                self.tensorboard()
 
 
+    def predict(self,fasta_path):
 
-    def predict(self,fasta_path,batchsize=1):
+        '''
+            Compute decoder output and attention score on the input FASTA file
+        '''
 
-        #Loading FASTA file
-        f = open(fasta_path,'r')
-        f.readline() #Remove header
-        sequence=''
-        for l in f:
-            sequence  = sequence + l.replace('\n','').lower()
+        # sequences = get_fasta(fasta_path,self.seq_len_DNA,self.seq_len_hist,split=False,batch_size=self.batch_size)
+        #
+        # sequences = torch.from_numpy(sequences).long().to(self.device)
 
-        #Split the sequence in chunks of size seq_len
-        Num_chunck = np.floor(len(sequence)/self.seq_len)
-        sequences = np.empty((Num_chunck,self.seq_len))
-        for i in range(Num_chunck):
-            sequences[i,:] = sequence[i*self.seq_len:(i+1)*self.seq_len]
+        self.encoder.eval()
+        self.decoder.eval()
+        self.EH2DH.eval()
+        self.phase = 'pred'
+        self.encoder_hidden = self.encoder.initHidden(self.device,self.batch_size)
+        self.decoder_hidden = self.decoder.initHidden(self.device,self.batch_size)
+        self.decoder_input = torch.zeros(self.batch_size,1,1,dtype=torch.float,device=self.device)
 
-        self.Seq2Seq.eval()
-        total_iter = np.ceil(len(sequences)/batchsize)
+        total_iter = np.ceil(len(sequences))
 
-        decoder_outputs=[]
-        attention_list=[]
-
-        for counter,(X,lt) in enumerate(tqdm(sequences,total=total_iter,desc='prediction')):
-
-            X = Variable(X)
-            if self.use_cuda:
-                X = X.cuda()
+        decoder_outputs = []
+        decoder_attentions = []
+        # for self.input_tensor in tqdm(sequences,total=total_iter,desc='prediction'):
+        for self.counter,(self.input_tensor,self.target_tensor) in enumerate(tqdm(self.train_loader,total=self.val_len,desc='prediction on training set')):
 
             with torch.no_grad():
-                self.foreward()
-                decoder_outputs.append(self.decoder_outputs)
-                attention_list.append(self.attention_list)
+                decoder_output,decoder_attention = self.forward()
 
-        decoder_outputs = np.hstack(decoder_outputs)
-        attention_list = np.hstack(attention_list)
+            decoder_outputs.append(trch2npy(decoder_output,self.device))
+            decoder_attentions.append(trch2npy(decoder_attention,self.device))
 
-        return decoder_outputs, attention_list
+        decoder_outputs = np.concatenate(decoder_outputs,axis=0)
 
-    def tensorboard(self):
-        # ===Add scalar losses===
+        return decoder_outputs,decoder_attentions
+
+
+    def write2tensorboard(self):
+        '''
+            Write losses in order to follow the network evolution using
+            tensorboard
+        '''
         for p in ['train','val']:
             prefix = p+'/'
             info = {}
             info[prefix] =  np.array(self.loss_record[p]).mean()
 
             for tag, value in info.items():
-                self.writer.add_scalars(tag, {tag:value}, self.epoch)
+                self.writer.add_scalars(tag, {tag:value}, self.epoch + self.counter)

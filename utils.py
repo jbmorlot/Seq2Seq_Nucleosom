@@ -17,10 +17,12 @@ def unpickle(file):
 
 
 class dataset_h5(Dataset):
-    def __init__(self,hist_occ,sequence):
+    def __init__(self,sequence,hist_occ,device,batch_size):
         super(dataset_h5, self).__init__()
-        self.hist_occ = hist_occ.T
-        self.sequence = sequence.T
+        self.sequence = torch.from_numpy(sequence).long()
+        self.hist_occ = torch.from_numpy(hist_occ).float()
+        self.device = device
+        self.batch_size=batch_size
 
         if self.hist_occ.shape[0]!=self.sequence.shape[0]:
             print('The two list needs to have the same length')
@@ -28,28 +30,39 @@ class dataset_h5(Dataset):
 
             raise AttributeError
 
-        # self.hist_occ = np.transpose(hist_occ,(1,2,0))
-        # self.sequence = np.transpose(sequence,(1,2,0))
+        self.sequence = self.sequence.to(self.device)
+        self.hist_occ = self.hist_occ.to(self.device)
 
-        # self.M = self.hist_occ.shape[1]
-        self.M = self.hist_occ.shape[0]
+        self.M = self.hist_occ.shape[2]#//self.batch_size
+        self.index=0
+    def __iter__(self):
+       return self
+    def __next__(self):
 
-    def __getitem__(self, index):
+        while True:
+            if self.index==self.M:
+                self.index=0
+                raise StopIteration()
 
-        # return self.sequence[:,index,:],self.hist_occ[:,index,:]
-        return self.sequence[index],self.hist_occ[index]
+            seq = self.sequence[:,:,self.index].unsqueeze(1)
+            hist = self.hist_occ[:,:,self.index].unsqueeze(1)
+
+            self.index+=1
+
+            return seq,hist
 
     def __len__(self):
         return self.M
 
 
-def get_dataset(histone_path,fasta_path,seq_len):
+def get_dataset(histone_path,fasta_path,seq_len_DNA,seq_len_hist,device,batch_size):
 
-    Xtrain,Xval = get_histones(histone_path,seq_len)
-    Ytrain,Yval = get_fasta(fasta_path,seq_len)
-    return dataset_h5(Xtrain,Ytrain),dataset_h5(Xval,Yval)
+    Xtrain,Xval = get_fasta(fasta_path,seq_len_DNA,seq_len_hist,batch_size)
+    Ytrain,Yval = get_histones(histone_path,seq_len_DNA,seq_len_hist,batch_size)
+    return dataset_h5(Xtrain,Znorm(Ytrain),device,batch_size),dataset_h5(Xval,Znorm(Yval),device,batch_size)
 
-def get_histones(histone_path,seq_len):
+
+def get_histones(histone_path,seq_len_DNA,seq_len_hist,batch_size,split=True):
     '''
         Load and split DNA and histone sequences before to format it into
         pytorch dataset
@@ -65,19 +78,26 @@ def get_histones(histone_path,seq_len):
     for h in hist_occ_list:
         hist_occ[int(h[0]):int(h[1])] = h[2]
 
+    hist_occ[hist_occ>3]=3 # Removing far outliers
 
     #Split the sequence in chunks of size seq_len
-    Num_chunck = int(len(hist_occ)/seq_len)
-    hist_occs = np.zeros((seq_len,Num_chunck),dtype=np.float32)
-    for i in range(Num_chunck):
-        hist_occs[:,1] = hist_occ[i*seq_len:(i+1)*seq_len]
+    len_per_batch = int(np.floor(len(hist_occ)/batch_size))
+    Num_chunck = int(np.ceil(len_per_batch/seq_len_hist))
+    hist_occs = np.zeros((batch_size,seq_len_hist,Num_chunck),dtype=np.float32)
+    for b in range(batch_size):
+        for i in range(Num_chunck):
+            if b*len_per_batch+(i+1)*seq_len_hist>=len(hist_occ):
+                break
+            hist_occs[b,:,i] = hist_occ[b*len_per_batch+i*seq_len_hist:b*len_per_batch+(i+1)*seq_len_hist]
 
-    train_len = int(Num_chunck*0.8)
+    if split:
+        train_len = int(Num_chunck*0.8)
+        return hist_occs[:,:,:train_len],hist_occs[:,:,train_len:]
+    else:
+        return hist_occs
 
-    return hist_occs[:,:train_len],hist_occs[:,train_len:]
 
-
-def get_fasta(fasta_path,seq_len):
+def get_fasta(fasta_path,seq_len_DNA,seq_len_hist,batch_size,split=True):
     '''
         Load and split DNA and histone sequences before to format it into
         pytorch dataset
@@ -92,53 +112,74 @@ def get_fasta(fasta_path,seq_len):
     def OHE(seq):
         nuc = np.array(['a','c','t','g'])
         return np.where(seq==nuc)[0]
-        # ohe = np.zeros(4)
-        # ohe[seq==nuc] = 1
-        # return ohe
 
     #Split the sequence in chunks of size seq_len
-    Num_chunck = int(len(sequence)/seq_len)
-    sequences = np.zeros((seq_len,Num_chunck),dtype=np.float32)
-    for i in range(Num_chunck):
-        for k in range(seq_len):
-            sequences[k,i] = OHE(sequence[i*seq_len+k])
+    len_per_batch = int(np.floor(len(sequence)/batch_size))
+    Num_chunck = int(np.ceil(len_per_batch/seq_len_DNA))
+    sequences = np.zeros((batch_size,seq_len_DNA,Num_chunck),dtype=np.float32)
+    for b in range(batch_size):
+        for i in range(Num_chunck):
+            start = int(b*len_per_batch + i*seq_len_hist - seq_len_DNA/2)
+            stop =  int(b*len_per_batch + i*seq_len_hist + seq_len_DNA/2)
+            for k,pos in enumerate(range(start,stop)):
+                if pos>=0 and pos<len(sequence):
+                    sequences[b,k,i] = OHE(sequence[pos])
+                else:
+                    sequences[b,k,i] = 4
 
-    # print(sequences.shape)
-    train_len = int(Num_chunck*0.8)
+    if split:
+        train_len = int(Num_chunck*0.8)
 
-    return sequences[:,:train_len],sequences[:,train_len:]
-
-
-
-def var2numpy(var,use_cuda=True):
-    if use_cuda:
-        return var.cpu().data.numpy()
-    return var.data.numpy()
-
-def numpy2var(nmpy,use_cuda=True):
-    if type(nmpy) is not np.ndarray or type(nmpy) is not np.array:
-        nmpy = np.array([nmpy],dtype=np.float32)
-    var = Variable(torch.from_numpy(nmpy))
-    if use_cuda:
-        return var.cuda()
-    return var
-
-def rgb2gray(rgb):
-    return np.dot(rgb[...,:3], [0.299, 0.587, 0.114])
+        return sequences[:,:,:train_len],sequences[:,:,train_len:]
+    else:
+        return sequences
 
 
-def data_parallel(module, input, device_ids, output_device=None):
+def Znorm(mat):
     '''
-        Allow to launch the model over multiple GPUs in parallel
+        Z-score normalization
     '''
-    if not device_ids:
-        return module(input)
+    std = mat.std(axis=1)[:,None,:]
+    std[std==0]=1
+    mean = mat.mean(axis=1)[:,None,:]
+    return (mat-mean)/std
 
-    if output_device is None:
-        output_device = device_ids[0]
+def showAttention(input_sentence, output_words, attentions):
+    # Set up figure with colorbar
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    cax = ax.matshow(attentions.numpy(), cmap='bone')
+    fig.colorbar(cax)
 
-    replicas = nn.parallel.replicate(module, device_ids)
-    inputs = nn.parallel.scatter(input, device_ids)
-    replicas = replicas[:len(inputs)]
-    outputs = nn.parallel.parallel_apply(replicas, inputs)
-    return nn.parallel.gather(outputs, output_device)
+    # Set up axes
+    ax.set_xticklabels([''] + input_sentence.split(' ') +
+                       ['<EOS>'], rotation=90)
+    ax.set_yticklabels([''] + output_words)
+
+    # Show label at every tick
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
+    ax.yaxis.set_major_locator(ticker.MultipleLocator(1))
+
+    plt.show()
+
+def trch2npy(trch,device):
+    if device.type=="cpu":
+        return trch.data.numpy()
+    else:
+        return trch.cpu().data.numpy()
+
+# def data_parallel(module, input, device_ids, output_device=None):
+#     '''
+#         Allow to launch the model over multiple GPUs in parallel
+#     '''
+#     if not device_ids:
+#         return module(input)
+#
+#     if output_device is None:
+#         output_device = device_ids[0]
+#
+#     replicas = nn.parallel.replicate(module, device_ids)
+#     inputs = nn.parallel.scatter(input, device_ids)
+#     replicas = replicas[:len(inputs)]
+#     outputs = nn.parallel.parallel_apply(replicas, inputs)
+#     return nn.parallel.gather(outputs, output_device)
