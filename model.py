@@ -30,10 +30,10 @@ class EncoderRNN(nn.Module):
 
 
 class EncoderHidden2DecoderHidden(nn.Module):
-        '''
-            Concatenate hidden layers from encoder and decoder at the last step
-            in order to initialise decoder hidden layer
-        '''
+    '''
+        Concatenate hidden layers from encoder and decoder at the last step
+        in order to initialise decoder hidden layer
+    '''
     def __init__(self, hidden_size):
         super(EncoderHidden2DecoderHidden, self).__init__()
         self.hidden_size = hidden_size
