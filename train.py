@@ -224,7 +224,7 @@ class Seq2Seq:
             with torch.no_grad():
                 self.forward()
                 self.record_loss()
-                self.tensorboard()
+                self.write2tensorboard()
 
 
     def predict(self,fasta_path):
